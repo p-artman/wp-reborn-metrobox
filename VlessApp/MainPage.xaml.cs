@@ -186,7 +186,42 @@ namespace VlessApp
             catch { }
 
             Loaded += MainPage_Loaded;
+
+            try
+            {
+                AgentControlBridge.Start(this);
+            }
+            catch (Exception ex)
+            {
+                AppLog.W($"[MainPage] AgentControlBridge.Start failed: {ex.Message}");
+            }
         }
+
+        internal void TriggerConnect()
+        {
+            if (!_isConnected)
+            {
+                ConnectBtn_Click(this, new RoutedEventArgs());
+            }
+        }
+
+        internal void TriggerDisconnect()
+        {
+            if (_isConnected)
+            {
+                ConnectBtn_Click(this, new RoutedEventArgs());
+            }
+        }
+
+        internal void TriggerSelectProfile(VlessProfile profile)
+        {
+            SelectProfile(profile);
+        }
+
+        internal List<VlessProfile> GetAllProfiles() => _allProfiles;
+        internal VlessProfile GetSelectedProfile() => _selectedProfile;
+        internal string GetCurrentStatus() => StatusText?.Text;
+        internal bool IsConnected() => _isConnected;
 
         private async void AutoUpdateTimer_Tick(object sender, object e)
         {
@@ -273,6 +308,8 @@ namespace VlessApp
                 {
                     MainRootGrid.Background = new SolidColorBrush(Color.FromArgb(255, 9, 13, 28));
                 }
+                if (AboutCardBorder != null) AboutCardBorder.CornerRadius = new CornerRadius(0);
+                if (ProxyInfoBorder != null) ProxyInfoBorder.CornerRadius = new CornerRadius(0);
             }
             else
             {
@@ -285,7 +322,7 @@ namespace VlessApp
 
         private async void MainPage_Loaded(object sender, RoutedEventArgs e)
         {
-            VpnManager.CleanupBrokenPrivatePhonebook();
+            VpnManager.PatchLocalRasphonePbk();
 
             ApplyLowEndGpuFixes();
 
@@ -301,6 +338,16 @@ namespace VlessApp
 
             await LoadProfilesAsync();
             await CheckAndAutoUpdateSubscriptionsAsync();
+
+            try
+            {
+                bool autoProxy = (Windows.Storage.ApplicationData.Current.LocalSettings.Values["v_ProxySharingEnabled"] as bool?) ?? false;
+                if (autoProxy)
+                {
+                    ProxySharingToggle.IsOn = true;
+                }
+            }
+            catch { }
         }
 
         private void Timer_Tick(object sender, object e)
@@ -357,23 +404,8 @@ namespace VlessApp
         {
             try
             {
-                // Проверяем наличие активного профиля соединения MetroBox или PPP/Tunnel в сетевом стеке Windows
-                var connections = Windows.Networking.Connectivity.NetworkInformation.GetConnectionProfiles();
-                foreach (var conn in connections)
-                {
-                    if (string.Equals(conn.ProfileName, "MetroBox", StringComparison.OrdinalIgnoreCase))
-                        return true;
-
-                    if (conn.NetworkAdapter != null)
-                    {
-                        uint type = conn.NetworkAdapter.IanaInterfaceType;
-                        // 23 = PPP (Point-to-Point Protocol, как адаптер MetroBox в ipconfig), 131 = Tunnel, 150 = Other Tunnel
-                        if (type == 23 || type == 131 || type == 150)
-                            return true;
-                    }
-                }
-
-                // Запасной опрос локальных имен
+                // Проверяем наличие назначенного виртуального IP туннеля (по умолчанию 11.16.1.1)
+                // в сетевом стеке Windows. Этот IP существует ТОЛЬКО когда активен виртуальный адаптер IVpnPlugIn.
                 string tunIp = Windows.Storage.ApplicationData.Current.LocalSettings.Values["v_TunIp"] as string;
                 if (string.IsNullOrEmpty(tunIp)) tunIp = "11.16.1.1";
 
@@ -394,12 +426,12 @@ namespace VlessApp
         }
 
         // Состояние туннеля глазами системы.
-        // Если плагин подтверждает готовность (v_TunnelUp) ИЛИ сетевой интерфейс туннеля активен —
-        // соединение 100% активно, даже если профиль был запущен из системных параметров
-        // Windows 10 Mobile, а не через прямой UWP-вызов ConnectProfileAsync.
         private static VpnManagementConnectionStatus ReadVpnState(VpnPlugInProfile plug)
         {
-            // 1. Прямой флаг от запущенного плагина
+            // Быстрая неблокирующая проверка NDIS сетевого стека:
+            // Если виртуальный IP туннеля (11.16.1.1) и интерфейс IANA отсутствуют,
+            // а флаг v_TunnelUp снят, туннель гарантированно отключен.
+            // Возвращаем Disconnected сразу, не зависая на COM-вызове plug.ConnectionStatus.
             bool pluginSaysUp = false;
             try
             {
@@ -407,14 +439,12 @@ namespace VlessApp
             }
             catch { }
 
-            // 2. Наличие активного сетевого интерфейса туннеля (PPP / Tunnel / MetroBox)
-            bool tunActive = false;
-            try { tunActive = IsVpnInterfaceActive(); } catch { }
+            bool ifaceActive = IsVpnInterfaceActive();
+            bool ianaActive = IsVpnProfileConnectedByIana();
 
-            // Если плагин подтверждает поднятый туннель ИЛИ сетевой интерфейс активен — туннель подключён!
-            if (pluginSaysUp || tunActive)
+            if (!pluginSaysUp && !ifaceActive && !ianaActive)
             {
-                return VpnManagementConnectionStatus.Connected;
+                return VpnManagementConnectionStatus.Disconnected;
             }
 
             if (plug != null)
@@ -432,6 +462,11 @@ namespace VlessApp
                 catch { }
             }
 
+            if (pluginSaysUp && ifaceActive)
+            {
+                return VpnManagementConnectionStatus.Connected;
+            }
+
             return VpnManagementConnectionStatus.Disconnected;
         }
 
@@ -444,7 +479,17 @@ namespace VlessApp
 
                 // Опрашиваем состояние туннеля в фоне с таймаутом
                 var ask = Task.Run(() => ReadVpnState(plug));
-                if (await Task.WhenAny(ask, Task.Delay(3000)) != ask) return;
+                if (await Task.WhenAny(ask, Task.Delay(2500)) != ask)
+                {
+                    if (!IsVpnInterfaceActive() && !IsVpnProfileConnectedByIana())
+                    {
+                        if (_isConnected || ConnectBtnText.Text != "ПОДКЛЮЧИТЬ")
+                        {
+                            ResetToDisconnectedUI();
+                        }
+                    }
+                    return;
+                }
 
                 VpnManagementConnectionStatus status = ask.Result;
 
@@ -502,7 +547,7 @@ namespace VlessApp
                 {
                     VlessVpnTask.LiveTile.ShowDisconnected();
 
-                    if (_isConnected)
+                    if (_isConnected || ConnectBtnText.Text != "ПОДКЛЮЧИТЬ")
                     {
                         ResetToDisconnectedUI();
                     }
@@ -522,7 +567,7 @@ namespace VlessApp
                                           "Проверьте подключение к Интернету (Wi-Fi) и настройки профиля в параметрах сети.",
                                 CloseButtonText = "Закрыть"
                             };
-                            _ = timeoutDialog.ShowAsync();
+                            _ = SafeShowDialogAsync(timeoutDialog);
                         }
                     }
                 }
@@ -530,6 +575,58 @@ namespace VlessApp
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"[STATUS CHECK FAIL] {ex.Message}");
+            }
+        }
+
+        private static ContentDialog _activeContentDialog = null;
+
+        internal static ContentDialog ActiveContentDialog => _activeContentDialog;
+
+        internal bool DismissActiveDialog(bool primary = false)
+        {
+            if (_activeContentDialog != null)
+            {
+                try
+                {
+                    var dlg = _activeContentDialog;
+                    _activeContentDialog = null;
+                    if (primary)
+                    {
+                        if (dlg.Title?.ToString() == "Подключение VPN" || dlg.Title?.ToString() == "Настройка VPN в системе (один раз)")
+                        {
+                            IsRedirectingToSettings = true;
+                            _ = Windows.System.Launcher.LaunchUriAsync(new Uri("ms-settings:network-vpn"));
+                        }
+                    }
+                    dlg.Hide();
+                    return true;
+                }
+                catch { }
+            }
+            return false;
+        }
+
+        private async Task<ContentDialogResult> SafeShowDialogAsync(ContentDialog dialog)
+        {
+            try
+            {
+                if (_activeContentDialog != null)
+                {
+                    try { _activeContentDialog.Hide(); } catch { }
+                    _activeContentDialog = null;
+                }
+                _activeContentDialog = dialog;
+                var res = await dialog.ShowAsync();
+                return res;
+            }
+            catch (Exception ex)
+            {
+                AppLog.W($"[DIALOG] SafeShowDialog: {ex.Message}");
+                return ContentDialogResult.None;
+            }
+            finally
+            {
+                if (_activeContentDialog == dialog) _activeContentDialog = null;
             }
         }
 
@@ -799,7 +896,7 @@ namespace VlessApp
                     }
                 }
 
-                VpnManager.CleanupBrokenPrivatePhonebook();
+                VpnManager.PatchLocalRasphonePbk();
 
                 var mine = await _vpnManager.EnsureOwnProfileAsync();
                 _cachedProfile = mine;
@@ -854,18 +951,26 @@ namespace VlessApp
                     AppLog.W($"[VPN MGR] Предварительный резолв не удался: {rx.Message}");
                 }
 
-                // Безусловно освобождаем транспортные порты и зависшие сессии RasMan перед новым подключением
-                try
+                // Если профиль уже активен в системе (например, запущен из шторки/параметров),
+                // синхронизируем UI вместо принудительного разрыва и повторного цикла
+                if (mine is VpnPlugInProfile activePlug)
                 {
-                    await ForceDisconnectActiveProfileAsync();
-                    await Task.Delay(500);
+                    try
+                    {
+                        if (activePlug.ConnectionStatus == VpnManagementConnectionStatus.Connected)
+                        {
+                            AppLog.W("[VPN MGR] Профиль уже подключен в системе — обновляем UI.");
+                            await CheckVpnStatusAsync();
+                            return;
+                        }
+                    }
+                    catch { }
                 }
-                catch { }
 
                 try
                 {
-                    VpnManager.CleanupBrokenPrivatePhonebook();
                     VpnManager.EnsurePasswordVaultCredentials();
+                    VpnManager.PatchLocalRasphonePbk();
 
                     AppLog.W("[VPN MGR] Настройки сохранены. Запрос перехода в параметры сети для запуска туннеля.");
 
@@ -873,12 +978,12 @@ namespace VlessApp
                     {
                         Title = "Подключение VPN",
                         Content = $"Сервер:\n{_selectedProfile.Name}\n\n" +
-                                  "Настройки сохранены. Для запуска туннеля в Windows 10 Mobile нажмите «Подключиться» и выберите профиль MetroBox в параметрах.",
+                                  "Настройки сохранены. Для запуска туннеля в Windows 10 Mobile нажмите «Подключиться» и включите профиль MetroBox в параметрах (или шторке).",
                         PrimaryButtonText = "Подключиться",
                         CloseButtonText = "Отмена"
                     };
 
-                    var dr = await runDialog.ShowAsync();
+                    var dr = await SafeShowDialogAsync(runDialog);
                     if (dr == ContentDialogResult.Primary)
                     {
                         ResetToDisconnectedUI();
@@ -917,14 +1022,35 @@ namespace VlessApp
                     return false;
                 }
 
-                bool any = false;
+                bool anyDisconnected = false;
                 foreach (var p in profiles)
                 {
+                    // Проверяем, наш ли это профиль по имени или по текущему активному подключению
+                    bool isOurProfile = string.Equals(p.ProfileName, VpnManager.ProfileName, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(p.ProfileName, "MetroBox", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(p.ProfileName, "Metrobox", StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(p.ProfileName, "VLESS Client", StringComparison.OrdinalIgnoreCase);
+
+                    if (!isOurProfile)
+                        continue;
+
+                    bool isConnectedStatus = false;
+                    if (p is VpnPlugInProfile plugStatus)
+                    {
+                        try { isConnectedStatus = plugStatus.ConnectionStatus == VpnManagementConnectionStatus.Connected; } catch { }
+                    }
+
+                    // Не вызываем DisconnectProfileAsync на уже отключенном профиле,
+                    // чтобы не активировать холостую фоновую задачу в svchost
+                    if (!isConnectedStatus && !_isConnected)
+                        continue;
+
                     try
                     {
                         var status = await agent.DisconnectProfileAsync(p);
                         AppLog.W($"  отключение профиля '{p.ProfileName}': {status}");
-                        any = true;
+                        if (status == Windows.Networking.Vpn.VpnManagementErrorStatus.Ok)
+                            anyDisconnected = true;
                     }
                     catch (Exception ex)
                     {
@@ -938,7 +1064,7 @@ namespace VlessApp
                 }
                 catch { }
 
-                return any;
+                return anyDisconnected;
             }
             catch (Exception ex)
             {
@@ -964,16 +1090,17 @@ namespace VlessApp
                 Content = "В Windows 10 Mobile системный профиль создаётся один раз в параметрах сети:\n\n" +
                           "1. Нажмите «Открыть параметры» ниже\n" +
                           "2. Нажмите «+ Добавить VPN-подключение»\n" +
-                          "3. Поставщик VPN: выберите «Metrobox»\n" +
+                          "3. Поставщик VPN: выберите «MetroBox»\n" +
                           "4. Имя подключения: MetroBox\n" +
                           "5. Имя или адрес сервера: 127.0.0.1 (уже скопировано в буфер)\n" +
-                          "6. Нажмите «Сохранить»\n\n" +
-                          "После этого VPN будет подключаться кнопкой прямо из приложения!",
+                          "6. Поля пользователя и пароля оставьте пустыми (для MetroBox они не требуются)\n" +
+                          "7. Нажмите «Сохранить»\n\n" +
+                          "После этого VPN готов к работе!",
                 PrimaryButtonText = "Открыть параметры",
                 CloseButtonText = "Закрыть"
             };
 
-            var result = await dialog.ShowAsync();
+            var result = await SafeShowDialogAsync(dialog);
             if (result == ContentDialogResult.Primary)
             {
                 await Windows.System.Launcher.LaunchUriAsync(new Uri("ms-settings:network-vpn"));
@@ -1289,7 +1416,7 @@ namespace VlessApp
             }
         }
 
-        private async Task ProcessAndAddImportTextAsync(string text)
+        internal async Task ProcessAndAddImportTextAsync(string text)
         {
             if (string.IsNullOrWhiteSpace(text)) return;
 
@@ -2661,12 +2788,175 @@ namespace VlessApp
 
         private void SettingsBtn_Click(object sender, RoutedEventArgs e)
         {
+            UpdateProxyInfoUI();
+            UpdateProfileInfoUI();
             AboutPageGrid.Visibility = Visibility.Visible;
+        }
+
+        public async void UpdateProfileInfoUI()
+        {
+            try
+            {
+                AutoCreateProfileToggle.IsOn = VpnManager.IsAutoCreateProfileEnabled();
+
+                var kind = await VpnManager.GetProfileKindAsync();
+                switch (kind)
+                {
+                    case VpnProfileKind.SystemVisible:
+                        ProfileStatusText.Text = "● Системный профиль готов (MetroBox в параметрах ОС)";
+                        ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 16, 185, 129));
+                        break;
+                    case VpnProfileKind.LocalHidden:
+                        ProfileStatusText.Text = "● Локальный скрытый профиль (экспериментально)";
+                        ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 59, 130, 246));
+                        break;
+                    default:
+                        ProfileStatusText.Text = "○ Системный профиль не найден (нажмите кнопку ниже)";
+                        ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 156, 163, 175));
+                        break;
+                }
+            }
+            catch { }
+        }
+
+        private async void OpenVpnSettingsBtn_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                var dp = new Windows.ApplicationModel.DataTransfer.DataPackage();
+                dp.SetText("127.0.0.1");
+                Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(dp);
+            }
+            catch { }
+            await Windows.System.Launcher.LaunchUriAsync(new Uri("ms-settings:network-vpn"));
+        }
+
+        private void AutoCreateProfileToggle_Toggled(object sender, RoutedEventArgs e)
+        {
+            VpnManager.SetAutoCreateProfileEnabled(AutoCreateProfileToggle.IsOn);
+        }
+
+        private async void RecreateProfileBtn_Click(object sender, RoutedEventArgs e)
+        {
+            RecreateProfileBtn.IsEnabled = false;
+            try
+            {
+                await VpnManager.DeleteHiddenProfileAsync();
+                bool ok = await VpnManager.CreateHiddenProfileAsync();
+                UpdateProfileInfoUI();
+
+                var d = new ContentDialog
+                {
+                    Title = ok ? "Профиль создан" : "Внимание",
+                    Content = ok
+                        ? "Локальный скрытый VPN-профиль успешно создан и настроен!\n\nОн подключается напрямую кнопкой из приложения без перехода в системные параметры."
+                        : "Не удалось автоматически зарегистрировать профиль. Вы можете добавить его вручную в параметрах сети.",
+                    CloseButtonText = "ОК"
+                };
+                await SafeShowDialogAsync(d);
+            }
+            finally
+            {
+                RecreateProfileBtn.IsEnabled = true;
+            }
+        }
+
+        private async void DeleteProfileBtn_Click(object sender, RoutedEventArgs e)
+        {
+            DeleteProfileBtn.IsEnabled = false;
+            try
+            {
+                bool wasDeleted = await VpnManager.DeleteHiddenProfileAsync();
+                UpdateProfileInfoUI();
+
+                ContentDialog d;
+                if (wasDeleted)
+                {
+                    d = new ContentDialog
+                    {
+                        Title = "Профиль удалён",
+                        Content = "Локальный VPN-профиль и телефонная книга очищены.",
+                        CloseButtonText = "ОК"
+                    };
+                }
+                else
+                {
+                    d = new ContentDialog
+                    {
+                        Title = "Профиль не найден",
+                        Content = "Скрытый VPN-профиль уже отсутствует — удалять нечего.",
+                        CloseButtonText = "ОК"
+                    };
+                }
+                await SafeShowDialogAsync(d);
+            }
+            finally
+            {
+                DeleteProfileBtn.IsEnabled = true;
+            }
         }
 
         private void AboutBackBtn_Click(object sender, RoutedEventArgs e)
         {
             AboutPageGrid.Visibility = Visibility.Collapsed;
+        }
+
+        private void UpdateProxyInfoUI()
+        {
+            try
+            {
+                if (ProxySharingServer.IsRunning)
+                {
+                    ProxyInfoPanel.Visibility = Visibility.Visible;
+                    var ips = ProxySharingServer.GetLocalIpAddresses();
+                    string primaryIp = ips.Count > 0 ? ips[0] : "192.168.137.1";
+                    ProxyHostPortText.Text = $"Прокси: {primaryIp}:{ProxySharingServer.CurrentPort} (HTTP / SOCKS5)";
+
+                    if (ips.Count > 0)
+                    {
+                        ProxyIpHintText.Text = $"Доступные IP: {string.Join(", ", ips)}\n(при хот-споте обычно: 192.168.137.1)";
+                    }
+                    else
+                    {
+                        ProxyIpHintText.Text = "Включите Мобильный хот-спот или подключитесь к Wi-Fi для раздачи.";
+                    }
+                }
+                else
+                {
+                    ProxyInfoPanel.Visibility = Visibility.Collapsed;
+                }
+            }
+            catch { }
+        }
+
+        private async void ProxySharingToggle_Toggled(object sender, RoutedEventArgs e)
+        {
+            var toggle = sender as ToggleSwitch;
+            if (toggle == null) return;
+
+            var localSettings = Windows.Storage.ApplicationData.Current.LocalSettings;
+
+            if (toggle.IsOn)
+            {
+                bool started = await ProxySharingServer.StartAsync(ProxySharingServer.DefaultPort);
+                if (started)
+                {
+                    localSettings.Values["v_ProxySharingEnabled"] = true;
+                    UpdateProxyInfoUI();
+                }
+                else
+                {
+                    toggle.IsOn = false;
+                    localSettings.Values["v_ProxySharingEnabled"] = false;
+                    ProxyInfoPanel.Visibility = Visibility.Collapsed;
+                }
+            }
+            else
+            {
+                await ProxySharingServer.StopAsync();
+                localSettings.Values["v_ProxySharingEnabled"] = false;
+                ProxyInfoPanel.Visibility = Visibility.Collapsed;
+            }
         }
 
         // ===================== отправка журналов =====================

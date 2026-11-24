@@ -614,7 +614,13 @@ namespace VlessVpnTask
 
         public void Disconnect(VpnChannel channel)
         {
-            if (_disconnected) { try { channel?.Stop(); } catch { } return; }
+            var ch = channel ?? _channel;
+            if (_disconnected)
+            {
+                try { ch?.Stop(); } catch { }
+                try { Disconnected?.Invoke(); } catch { }
+                return;
+            }
             _disconnected = true;
             SetTunnelUp(false);
 
@@ -636,13 +642,18 @@ namespace VlessVpnTask
             try { _awgEngine?.SignalStop(); } catch { }
             _awgEngine = null;
             try { _natEngine?.SignalStop(); } catch { }
+            _natEngine = null;
 
+            // Канал RasMan останавливаем первым, пока ассоциированный с ним транспорт _dummyTransport еще жив!
+            try { ch?.Stop(); } catch { }
+            _channel = null;
+
+            try { _triggerWriter?.DetachStream(); _triggerWriter?.Dispose(); } catch { }
+            _triggerWriter = null;
             try { _dummyTransport?.Dispose(); } catch { }
             _dummyTransport = null;
             try { _dummyTrigger?.Dispose(); } catch { }
             _dummyTrigger = null;
-
-            try { channel?.Stop(); } catch { }
 
             IsConnected = false;
             try { Disconnected?.Invoke(); } catch { }
