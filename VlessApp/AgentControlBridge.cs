@@ -183,19 +183,6 @@ namespace VlessApp
                                 $"\"total_profiles\":{_mainPage.GetAllProfiles().Count}"));
                             break;
 
-                        case "recreate_profile":
-                            await VpnManager.DeleteHiddenProfileAsync();
-                            bool recOk = await VpnManager.CreateHiddenProfileAsync();
-                            _mainPage.UpdateProfileInfoUI();
-                            tcs.SetResult(CreateResponseJson(cmdId, recOk ? "ok" : "error", recOk ? "Hidden profile recreated" : "Recreate failed"));
-                            break;
-
-                        case "delete_profile":
-                            bool delOk = await VpnManager.DeleteHiddenProfileAsync();
-                            _mainPage.UpdateProfileInfoUI();
-                            tcs.SetResult(CreateResponseJson(cmdId, delOk ? "ok" : "error", delOk ? "Hidden profile deleted" : "Delete failed"));
-                            break;
-
                         case "profiles_diag":
                             var diagAgent = new Windows.Networking.Vpn.VpnManagementAgent();
                             var pList = await diagAgent.GetProfilesAsync();

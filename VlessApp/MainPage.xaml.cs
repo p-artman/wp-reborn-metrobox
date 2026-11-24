@@ -322,7 +322,7 @@ namespace VlessApp
 
         private async void MainPage_Loaded(object sender, RoutedEventArgs e)
         {
-            VpnManager.PatchLocalRasphonePbk();
+            VpnManager.CleanupBrokenPrivatePhonebook();
 
             ApplyLowEndGpuFixes();
 
@@ -896,7 +896,7 @@ namespace VlessApp
                     }
                 }
 
-                VpnManager.PatchLocalRasphonePbk();
+                VpnManager.CleanupBrokenPrivatePhonebook();
 
                 var mine = await _vpnManager.EnsureOwnProfileAsync();
                 _cachedProfile = mine;
@@ -969,8 +969,8 @@ namespace VlessApp
 
                 try
                 {
+                    VpnManager.CleanupBrokenPrivatePhonebook();
                     VpnManager.EnsurePasswordVaultCredentials();
-                    VpnManager.PatchLocalRasphonePbk();
 
                     AppLog.W("[VPN MGR] Настройки сохранены. Запрос перехода в параметры сети для запуска туннеля.");
 
@@ -2797,23 +2797,16 @@ namespace VlessApp
         {
             try
             {
-                AutoCreateProfileToggle.IsOn = VpnManager.IsAutoCreateProfileEnabled();
-
-                var kind = await VpnManager.GetProfileKindAsync();
-                switch (kind)
+                var profile = await _vpnManager.FindOwnProfileAsync();
+                if (profile != null)
                 {
-                    case VpnProfileKind.SystemVisible:
-                        ProfileStatusText.Text = "● Системный профиль готов (MetroBox в параметрах ОС)";
-                        ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 16, 185, 129));
-                        break;
-                    case VpnProfileKind.LocalHidden:
-                        ProfileStatusText.Text = "● Локальный скрытый профиль (экспериментально)";
-                        ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 59, 130, 246));
-                        break;
-                    default:
-                        ProfileStatusText.Text = "○ Системный профиль не найден (нажмите кнопку ниже)";
-                        ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 156, 163, 175));
-                        break;
+                    ProfileStatusText.Text = $"● Системный профиль готов ({profile.ProfileName} в параметрах ОС)";
+                    ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 16, 185, 129));
+                }
+                else
+                {
+                    ProfileStatusText.Text = "○ Системный профиль не найден (нажмите кнопку ниже)";
+                    ProfileStatusText.Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 156, 163, 175));
                 }
             }
             catch { }
@@ -2829,71 +2822,6 @@ namespace VlessApp
             }
             catch { }
             await Windows.System.Launcher.LaunchUriAsync(new Uri("ms-settings:network-vpn"));
-        }
-
-        private void AutoCreateProfileToggle_Toggled(object sender, RoutedEventArgs e)
-        {
-            VpnManager.SetAutoCreateProfileEnabled(AutoCreateProfileToggle.IsOn);
-        }
-
-        private async void RecreateProfileBtn_Click(object sender, RoutedEventArgs e)
-        {
-            RecreateProfileBtn.IsEnabled = false;
-            try
-            {
-                await VpnManager.DeleteHiddenProfileAsync();
-                bool ok = await VpnManager.CreateHiddenProfileAsync();
-                UpdateProfileInfoUI();
-
-                var d = new ContentDialog
-                {
-                    Title = ok ? "Профиль создан" : "Внимание",
-                    Content = ok
-                        ? "Локальный скрытый VPN-профиль успешно создан и настроен!\n\nОн подключается напрямую кнопкой из приложения без перехода в системные параметры."
-                        : "Не удалось автоматически зарегистрировать профиль. Вы можете добавить его вручную в параметрах сети.",
-                    CloseButtonText = "ОК"
-                };
-                await SafeShowDialogAsync(d);
-            }
-            finally
-            {
-                RecreateProfileBtn.IsEnabled = true;
-            }
-        }
-
-        private async void DeleteProfileBtn_Click(object sender, RoutedEventArgs e)
-        {
-            DeleteProfileBtn.IsEnabled = false;
-            try
-            {
-                bool wasDeleted = await VpnManager.DeleteHiddenProfileAsync();
-                UpdateProfileInfoUI();
-
-                ContentDialog d;
-                if (wasDeleted)
-                {
-                    d = new ContentDialog
-                    {
-                        Title = "Профиль удалён",
-                        Content = "Локальный VPN-профиль и телефонная книга очищены.",
-                        CloseButtonText = "ОК"
-                    };
-                }
-                else
-                {
-                    d = new ContentDialog
-                    {
-                        Title = "Профиль не найден",
-                        Content = "Скрытый VPN-профиль уже отсутствует — удалять нечего.",
-                        CloseButtonText = "ОК"
-                    };
-                }
-                await SafeShowDialogAsync(d);
-            }
-            finally
-            {
-                DeleteProfileBtn.IsEnabled = true;
-            }
         }
 
         private void AboutBackBtn_Click(object sender, RoutedEventArgs e)
